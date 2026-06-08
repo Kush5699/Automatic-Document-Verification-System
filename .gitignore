@@ -56,3 +56,7 @@ WhatsApp Image*
 # Environment / API keys
 .env
 *.env
+
+# Demo and screenshot files
+*.mp4
+*.jpeg

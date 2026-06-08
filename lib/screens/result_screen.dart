@@ -3,11 +3,16 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import '../models/identity_data.dart';
 import '../models/image_holder.dart';
-import '../services/groq_service.dart';
+import '../services/llm_service.dart';
+import '../services/yolo_service.dart';
+import '../services/smart_extractor.dart';
 import 'home_screen.dart';
 
 // Conditional import: real OCR on mobile, stub on web
 import '../services/ocr_service.dart' if (dart.library.js_interop) '../services/ocr_service_stub.dart';
+
+// Conditional import: Tesseract.js OCR on web, stub on mobile
+import '../services/web_ocr_stub.dart' if (dart.library.js_interop) '../services/web_ocr.dart';
 
 class ResultScreen extends StatefulWidget {
   const ResultScreen({super.key});
@@ -63,15 +68,98 @@ class _ResultScreenState extends State<ResultScreen>
     final totalStopwatch = Stopwatch()..start();
 
     try {
-      if (kIsWeb) {
-        // ── Web: Use Groq Vision API directly ──
+      final llmService = LlmService(
+        backend: HomeScreen.backend,
+        apiKey: HomeScreen.groqApiKey,
+        ollamaUrl: HomeScreen.ollamaUrl,
+        ollamaModel: HomeScreen.ollamaModel,
+      );
+
+      if (HomeScreen.backend == LlmBackend.smart) {
+        // ══════════════════════════════════════════════
+        //  SMART MODE: OCR → Regex Engine (no LLM!)
+        // ══════════════════════════════════════════════
+        setState(() { _ocrDone = false; _extractionDone = false; });
+
+        // Step 1: OCR (platform-aware)
+        final ocrStopwatch = Stopwatch()..start();
+        String ocrText;
+        if (kIsWeb) {
+          ocrText = await runWebOcr(_imageBytes!);
+        } else {
+          final ocrService = OcrService();
+          ocrText = await ocrService.extractTextFromPath(ImageHolder.imagePath!);
+          ocrService.dispose();
+        }
+        ocrStopwatch.stop();
+
+        if (!mounted) return;
         setState(() {
-          _ocrDone = false;
-          _extractionDone = false;
+          _rawOcrText = ocrText;
+          _ocrDone = true;
+          _ocrTimeMs = ocrStopwatch.elapsedMilliseconds.toDouble();
         });
 
-        final groqService = GroqService(apiKey: HomeScreen.groqApiKey);
-        final result = await groqService.extractFromImage(_imageBytes!);
+        if (ocrText.trim().isEmpty || ocrText.startsWith('OCR Error')) {
+          setState(() {
+            _isProcessing = false;
+            _errorMessage = 'No text detected. Try a clearer image.';
+          });
+          return;
+        }
+
+        // Step 2: Smart extraction (pure Dart regex — < 10ms!)
+        final extractionStopwatch = Stopwatch()..start();
+        final smartExtractor = SmartExtractor();
+        final identityData = smartExtractor.extract(ocrText);
+        extractionStopwatch.stop();
+        totalStopwatch.stop();
+
+        if (!mounted) return;
+        setState(() {
+          _identityData = identityData;
+          _identityData!.rawOcrText = ocrText;
+          _identityData!.processingTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
+          _extractionDone = true;
+          _extractionTimeMs = extractionStopwatch.elapsedMilliseconds.toDouble();
+          _totalTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
+          _isProcessing = false;
+        });
+      } else if (HomeScreen.backend == LlmBackend.yolo) {
+        // ══════════════════════════════════════════════
+        //  YOLO MODE: Send image to Python backend
+        // ══════════════════════════════════════════════
+        setState(() { _ocrDone = false; _extractionDone = false; });
+
+        final yoloService = YoloService(backendUrl: HomeScreen.yoloUrl);
+        final result = await yoloService.extractFromImage(_imageBytes!);
+        totalStopwatch.stop();
+
+        if (!mounted) return;
+
+        // Build raw OCR text from detections
+        final rawDetections = result['raw_detections'] as List? ?? [];
+        final rawText = rawDetections.map((d) => '${d['field']}: ${d['text']}').join('\n');
+
+        final identityData = yoloService.toIdentityData(result);
+
+        setState(() {
+          _rawOcrText = rawText.isEmpty ? 'No fields detected' : rawText;
+          _ocrDone = true;
+          _ocrTimeMs = 0;
+          _identityData = identityData;
+          _identityData!.rawOcrText = _rawOcrText;
+          _identityData!.processingTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
+          _extractionDone = true;
+          _extractionTimeMs = (result['processing_time_ms'] as num?)?.toDouble() ?? totalStopwatch.elapsedMilliseconds.toDouble();
+          _totalTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
+          _isProcessing = false;
+        });
+      } else if (kIsWeb && llmService.supportsVision) {
+        // ── Web + Vision model: send image directly ──
+        setState(() { _ocrDone = false; _extractionDone = false; });
+
+        final result = await llmService.extractFromImage(_imageBytes!);
         totalStopwatch.stop();
 
         if (!mounted) return;
@@ -82,19 +170,55 @@ class _ResultScreenState extends State<ResultScreen>
         setState(() {
           _rawOcrText = rawText;
           _ocrDone = true;
-          _ocrTimeMs = 0; // Vision does it all in one
+          _ocrTimeMs = 0;
           _identityData = IdentityData.fromJson(extracted);
           _identityData!.rawOcrText = rawText;
-          _identityData!.processingTimeMs =
-              totalStopwatch.elapsedMilliseconds.toDouble();
+          _identityData!.processingTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
           _extractionDone = true;
           _extractionTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
           _totalTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
           _isProcessing = false;
         });
+      } else if (kIsWeb && !llmService.supportsVision) {
+        // ── Web + Text-only model: Tesseract.js OCR → text LLM ──
+        setState(() { _ocrDone = false; _extractionDone = false; });
+
+        final ocrStopwatch = Stopwatch()..start();
+        final ocrText = await runWebOcr(_imageBytes!);
+        ocrStopwatch.stop();
+
+        if (!mounted) return;
+        setState(() {
+          _rawOcrText = ocrText;
+          _ocrDone = true;
+          _ocrTimeMs = ocrStopwatch.elapsedMilliseconds.toDouble();
+        });
+
+        if (ocrText.trim().isEmpty || ocrText.startsWith('OCR Error')) {
+          setState(() {
+            _isProcessing = false;
+            _errorMessage = ocrText.startsWith('OCR Error') ? ocrText : 'No text detected.';
+          });
+          return;
+        }
+
+        final extractionStopwatch = Stopwatch()..start();
+        final identityData = await llmService.extractEntities(ocrText);
+        extractionStopwatch.stop();
+        totalStopwatch.stop();
+
+        if (!mounted) return;
+        setState(() {
+          _identityData = identityData;
+          _identityData!.rawOcrText = ocrText;
+          _identityData!.processingTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
+          _extractionDone = true;
+          _extractionTimeMs = extractionStopwatch.elapsedMilliseconds.toDouble();
+          _totalTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
+          _isProcessing = false;
+        });
       } else {
-        // ── Mobile: ML Kit OCR → Groq text LLM ──
-        // Step 1: OCR
+        // ── Mobile: ML Kit OCR → LLM text extraction ──
         final ocrStopwatch = Stopwatch()..start();
         final ocrService = OcrService();
         final imagePath = ImageHolder.imagePath!;
@@ -112,16 +236,13 @@ class _ResultScreenState extends State<ResultScreen>
         if (ocrText.trim().isEmpty) {
           setState(() {
             _isProcessing = false;
-            _errorMessage =
-                'No text detected in the image. Please try again with a clearer image.';
+            _errorMessage = 'No text detected in the image. Please try again with a clearer image.';
           });
           return;
         }
 
-        // Step 2: Groq Extraction
         final extractionStopwatch = Stopwatch()..start();
-        final groqService = GroqService(apiKey: HomeScreen.groqApiKey);
-        final identityData = await groqService.extractEntities(ocrText);
+        final identityData = await llmService.extractEntities(ocrText);
         extractionStopwatch.stop();
         totalStopwatch.stop();
 
@@ -129,11 +250,9 @@ class _ResultScreenState extends State<ResultScreen>
         setState(() {
           _identityData = identityData;
           _identityData!.rawOcrText = ocrText;
-          _identityData!.processingTimeMs =
-              totalStopwatch.elapsedMilliseconds.toDouble();
+          _identityData!.processingTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
           _extractionDone = true;
-          _extractionTimeMs =
-              extractionStopwatch.elapsedMilliseconds.toDouble();
+          _extractionTimeMs = extractionStopwatch.elapsedMilliseconds.toDouble();
           _totalTimeMs = totalStopwatch.elapsedMilliseconds.toDouble();
           _isProcessing = false;
         });
@@ -299,11 +418,15 @@ class _ResultScreenState extends State<ResultScreen>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    kIsWeb
-                        ? 'Processing with Groq Vision AI...'
-                        : _ocrDone
-                            ? 'Extracting entities with AI...'
-                            : 'Running OCR on image...',
+                    HomeScreen.backend == LlmBackend.smart
+                        ? (_ocrDone ? 'Extracting fields with regex engine...' : 'Running OCR...')
+                        : HomeScreen.backend == LlmBackend.yolo
+                            ? 'Detecting fields with YOLOv8...'
+                            : kIsWeb
+                                ? 'Processing with AI Vision...'
+                                : _ocrDone
+                                    ? 'Extracting entities with AI...'
+                                    : 'Running OCR on image...',
                     style: const TextStyle(
                       color: Colors.white,
                       fontSize: 15,
@@ -312,11 +435,19 @@ class _ResultScreenState extends State<ResultScreen>
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    kIsWeb
-                        ? 'Sending image to Groq Vision for text detection + extraction'
-                        : _ocrDone
-                            ? 'Sending text to Groq LLM for structured extraction'
-                            : 'Google ML Kit is recognizing text on-device',
+                    HomeScreen.backend == LlmBackend.smart
+                        ? (_ocrDone ? 'Pure Dart regex — no AI, no network, instant' : (kIsWeb ? 'Tesseract.js in-browser OCR' : 'ML Kit on-device OCR'))
+                        : HomeScreen.backend == LlmBackend.yolo
+                            ? 'Python backend: YOLO detection + EasyOCR'
+                            : kIsWeb
+                                ? (HomeScreen.backend == LlmBackend.ollama
+                                    ? 'Processing image locally with Ollama (private)'
+                                    : 'Sending image to Groq Vision API')
+                                : _ocrDone
+                                    ? (HomeScreen.backend == LlmBackend.ollama
+                                        ? 'Extracting fields locally with Ollama (private)'
+                                        : 'Sending text to Groq LLM for extraction')
+                                    : 'Google ML Kit is recognizing text on-device',
                     style: TextStyle(
                       color: Colors.white.withValues(alpha: 0.5),
                       fontSize: 12,

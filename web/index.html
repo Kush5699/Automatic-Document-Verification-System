@@ -33,6 +33,22 @@
   <link rel="manifest" href="manifest.json">
 </head>
 <body>
+  <!-- Tesseract.js for browser-based OCR (used with non-vision models like gemma3:1b) -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <script>
+    // Global function callable from Dart via JS interop
+    async function tesseractOCR(base64Image) {
+      try {
+        const dataUrl = 'data:image/jpeg;base64,' + base64Image;
+        const result = await Tesseract.recognize(dataUrl, 'eng', {
+          logger: m => {}  // silent
+        });
+        return result.data.text;
+      } catch (e) {
+        return 'OCR Error: ' + e.message;
+      }
+    }
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>
